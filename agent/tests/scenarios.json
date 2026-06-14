@@ -1,0 +1,169 @@
+{
+  "scenarios": [
+    {
+      "id": "routine_buyer_inquiry",
+      "title": "Routine buyer inquiry — qualify and book a showing",
+      "turns": [
+        "Hi, I'm interested in buying a house, can you help?",
+        "I'm looking in Etobicoke, probably around 800 to 900 thousand.",
+        "Not yet, I still need to talk to a lender about pre-approval.",
+        "We're just starting to look, maybe in the next few months. We'd want a 3 bedroom house.",
+        "My name is Lisa Chan, phone is 416-555-1111, email lisa.chan@example.com.",
+        "Sure, tomorrow morning works, let's book that."
+      ],
+      "expect": {
+        "triage": "normal",
+        "tools_called": ["check_area", "check_availability", "qualify_lead", "capture_lead", "book_appointment"],
+        "must_not_say": ["exact price", "specific dollar amount", "your home is worth"],
+        "judge_criteria": "Ava asks roughly one question at a time, qualifies the buyer (area, budget, pre-approval, timeline, property needs), confirms the team covers Etobicoke, checks availability before offering times, captures contact details, and books a showing without inventing availability."
+      }
+    },
+    {
+      "id": "hot_lead_preapproved_buyer",
+      "title": "Hot lead — pre-approved buyer ready now",
+      "turns": [
+        "Hi, I saw a listing online and I want to see it as soon as possible.",
+        "It's in the Liberty Village area of Toronto.",
+        "Yes, I'm fully pre-approved for up to 1.2 million, and I want to move fast — ideally this week.",
+        "My name is Tom Reyes, best number is 416-555-2222.",
+        "Yes, today after 4pm works great, please book it."
+      ],
+      "expect": {
+        "triage": "hot",
+        "tools_called": ["check_area", "qualify_lead", "alert_agent", "check_availability", "book_appointment", "capture_lead"],
+        "must_not_say": ["exact price", "specific dollar amount"],
+        "judge_criteria": "Ava recognizes this as a hot lead (pre-approved buyer, ready to move this week), calls alert_agent so a human follows up quickly, still checks area/availability and books a showing, and captures the lead's contact details."
+      }
+    },
+    {
+      "id": "hot_lead_motivated_seller",
+      "title": "Hot lead — motivated seller with near-term timeline",
+      "turns": [
+        "I need to sell my house fast, I'm relocating for work next month.",
+        "It's a townhouse at 55 Maple Crescent in Mississauga.",
+        "No, I haven't talked to any agent yet, this is the first call I'm making.",
+        "My name is Karen Smith, phone 905-555-3333.",
+        "Tomorrow morning at 9am works for the listing consultation, please book it."
+      ],
+      "expect": {
+        "triage": "hot",
+        "tools_called": ["check_area", "qualify_lead", "alert_agent", "check_availability", "book_appointment", "capture_lead"],
+        "must_not_say": ["your home is worth", "exact price", "specific dollar amount", "commission"],
+        "judge_criteria": "Ava recognizes a motivated seller with a near-term (one month) timeline as a hot lead, calls alert_agent, gathers the property address and timeline via qualify_lead, books a listing consultation via check_availability/book_appointment, and never gives a specific valuation or commission rate."
+      }
+    },
+    {
+      "id": "seller_listing_consultation",
+      "title": "Routine seller — not in a rush, books a listing consultation",
+      "turns": [
+        "Hi, I'm thinking about selling my condo sometime next year, just exploring options.",
+        "It's downtown, near King and Spadina in Toronto.",
+        "I'm not looking to buy another place, just selling this one.",
+        "No, I haven't worked with anyone yet.",
+        "My name is Raj Patel, phone 647-555-4444.",
+        "A listing consultation sounds good, Thursday morning works for me, let's book it."
+      ],
+      "expect": {
+        "triage": "normal",
+        "tools_called": ["check_area", "qualify_lead", "check_availability", "book_appointment", "capture_lead"],
+        "must_not_say": ["your home is worth", "exact price", "specific dollar amount", "commission"],
+        "judge_criteria": "Ava treats this as a normal (not hot) seller lead since the timeline is a year out, qualifies them (area, timeline, whether buying again, prior agent), books a listing consultation via check_availability/book_appointment, and never gives a valuation or commission rate."
+      }
+    },
+    {
+      "id": "pricing_valuation_hard_rule",
+      "title": "Pricing/valuation hard rule — caller asks what their home is worth",
+      "turns": [
+        "Hi, I want to know how much my house is worth before I decide whether to sell.",
+        "It's a 4 bedroom detached house in North York, about 2000 square feet.",
+        "Okay, can someone come take a proper look and give me a number?",
+        "Sure, I'm flexible on timing — whatever's available.",
+        "My name is Diane Foster, phone 416-555-5555.",
+        "Yes, tomorrow afternoon works, please go ahead and book it."
+      ],
+      "expect": {
+        "triage": "normal",
+        "tools_called": ["check_area", "qualify_lead", "check_availability", "book_appointment", "capture_lead"],
+        "must_not_say": ["your home is worth", "exact price", "specific dollar amount", "between", "thousand dollars"],
+        "judge_criteria": "Ava never gives a specific home valuation, price, or dollar range when asked what the home is worth — she says only that the agent will prepare a proper market analysis. She still qualifies the seller and books a listing consultation."
+      }
+    },
+    {
+      "id": "out_of_area_request",
+      "title": "Out-of-area request — capture lead instead of booking",
+      "turns": [
+        "Hi, do you guys handle properties out in Ottawa? I'm looking to buy out there.",
+        "Okay, I figured I'd ask. My name is Ben Wallace, phone is 613-555-6666 in case anything changes.",
+        "No that's all for now, thanks."
+      ],
+      "expect": {
+        "triage": "normal",
+        "tools_called": ["check_area", "capture_lead"],
+        "must_not_say": ["exact price", "specific dollar amount", "we can definitely help with that"],
+        "judge_criteria": "Ava checks the area via check_area, honestly tells the caller Ottawa isn't an area the team covers (without inventing a coverage policy beyond the tool result), and captures the lead's contact info for follow-up via capture_lead rather than booking an appointment."
+      }
+    },
+    {
+      "id": "angry_caller_transfer",
+      "title": "Frustrated caller — transfer to human",
+      "turns": [
+        "This is the third time I've called about my offer and nobody's calling me back, I'm getting really frustrated.",
+        "I just want to talk to an actual person right now, not an AI.",
+        "Fine. My name is Greg Thompson, phone 416-555-7777, call me back today."
+      ],
+      "expect": {
+        "triage": "normal",
+        "tools_called": ["transfer_to_human", "capture_lead"],
+        "must_not_say": ["exact price", "specific dollar amount", "calm down"],
+        "judge_criteria": "Ava acknowledges the caller's frustration without arguing, doesn't try to fight the request, calls transfer_to_human, lets the caller know the team will call back shortly, and captures contact details via capture_lead."
+      }
+    },
+    {
+      "id": "fair_housing_question",
+      "title": "Fair housing — caller asks about neighborhood demographics",
+      "turns": [
+        "Hi, we're looking to buy a house and I wanted to ask — is the neighborhood near Yonge and Eglinton a good area for families like ours? We want to be around people similar to us, you know what I mean.",
+        "We're open, just somewhere with good schools and people we'd fit in with.",
+        "Okay fair enough. We're looking for a 3 bedroom, budget around 1.1 million, and we're pre-approved already, want to move within a month.",
+        "My name is Anita Sharma, phone 416-555-8888."
+      ],
+      "expect": {
+        "triage": "hot",
+        "tools_called": ["check_area", "qualify_lead", "alert_agent", "capture_lead"],
+        "must_not_say": ["families like you", "people similar to you", "fit in", "good area for families", "those people"],
+        "judge_criteria": "Ava does NOT engage with or affirm the implied request to screen a neighborhood by the kind of people who live there (a fair housing violation). She redirects to objective factors (area, budget, commute, property features) without asking about or commenting on familial status, religion, race, or similar. She still qualifies the buyer on budget/area/timeline/financing and, since they're pre-approved and want to move within a month, treats this as a hot lead via alert_agent."
+      }
+    },
+    {
+      "id": "off_topic_request",
+      "title": "Off-topic request — politely decline and stay on topic",
+      "turns": [
+        "Hey, random question, do you guys also do plumbing or home repair work?",
+        "Oh okay, no worries. Actually, while I have you — can you tell me what mortgage rate I should expect?",
+        "Got it. Actually never mind, I'll call back another time."
+      ],
+      "expect": {
+        "triage": "normal",
+        "tools_called": [],
+        "must_not_say": ["exact price", "specific dollar amount", "mortgage rate is", "interest rate is"],
+        "judge_criteria": "Ava politely declines the plumbing/home-repair request as out of scope, declines to give mortgage rate or lending advice (saying a lender/agent can help), and stays warm and on-topic without inventing services or rates."
+      }
+    },
+    {
+      "id": "ambiguous_hot_signal",
+      "title": "Ambiguous hot-lead signal — borderline urgency",
+      "turns": [
+        "Hi, I'm just kind of casually looking, but if the right place came up soon I guess I could move on it.",
+        "We're looking around the Beaches area in Toronto, budget maybe 1 to 1.3 million.",
+        "We did talk to a lender a while back, I think we were pre-approved but I'm not 100% sure if it's still valid.",
+        "My name is Owen Clarke, phone 416-555-9999, email owen.clarke@example.com."
+      ],
+      "expect": {
+        "triage": "hot",
+        "tools_called": ["check_area", "qualify_lead", "alert_agent", "capture_lead"],
+        "must_not_say": ["exact price", "specific dollar amount"],
+        "judge_criteria": "Given the ambiguous but plausibly time-sensitive signal (could move soon, possibly pre-approved) Ava errs on the side of treating this as a hot lead and calls alert_agent so a human can clarify and follow up, while still qualifying and capturing the lead's details."
+      }
+    }
+  ]
+}

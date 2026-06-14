@@ -1,0 +1,8 @@
+pipecat-ai[google,webrtc,runner]
+python-dotenv
+loguru
+twilio
+supabase
+
+# Optional: krisp_audio (proprietary, requires a Krisp license) — only needed if
+# KRISP_VIVA_API_KEY / KRISP_VIVA_FILTER_MODEL_PATH are set in .env.

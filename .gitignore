@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Env / secrets
+.env
+secrets.txt.txt
+
+# Logs and test artifacts
+agent/logs/
+agent/tests/results/
+
+# Reference checkouts (not part of this project)
+_refs/
+
+# Misc
+claudechat.txt
+
+# Claude Code local-only state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

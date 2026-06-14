@@ -1,0 +1,52 @@
+name: Deploy voice agent to Pipecat Cloud
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent/bot.py"
+      - "agent/prompts.py"
+      - "agent/tools.py"
+      - "agent/sms.py"
+      - "agent/db.py"
+      - "agent/webhooks.py"
+      - "agent/requirements.txt"
+      - "agent/Dockerfile"
+      - "agent/pcc-deploy.toml"
+      - ".github/workflows/deploy-agent.yml"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push agent image
+        uses: docker/build-push-action@v5
+        with:
+          context: agent
+          file: agent/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/summit-realty-ava:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/summit-realty-ava:${{ github.sha }}
+
+      - name: Install Pipecat Cloud CLI
+        run: pip install pipecatcloud
+
+      - name: Authenticate with Pipecat Cloud
+        run: pcc auth login --token "${{ secrets.PIPECAT_CLOUD_API_TOKEN }}"
+
+      - name: Deploy to Pipecat Cloud
+        working-directory: agent
+        run: |
+          pcc deploy \
+            --image "${{ secrets.DOCKERHUB_USERNAME }}/summit-realty-ava:${{ github.sha }}" \
+            --credentials "${{ secrets.DOCKERHUB_USERNAME }}" \
+            -f pcc-deploy.toml

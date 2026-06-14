@@ -1,5 +1,5 @@
 agent_name = "summit-realty-ava"
-secret_set = "summit-realty-ava-secrets"
+secret_set = "realestate-voiceai-demo"
 agent_profile = "agent-1x"
 
 [krisp_viva]

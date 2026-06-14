@@ -27,11 +27,15 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Build and push agent image
         uses: docker/build-push-action@v5
         with:
           context: agent
           file: agent/Dockerfile
+          platforms: linux/arm64
           push: true
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/summit-realty-ava:latest
@@ -41,12 +45,13 @@ jobs:
         run: pip install pipecatcloud
 
       - name: Authenticate with Pipecat Cloud
-        run: pcc auth login --token "${{ secrets.PIPECAT_CLOUD_API_TOKEN }}"
+        run: echo "${{ secrets.PIPECAT_CLOUD_API_TOKEN }}" | pcc auth use-pat
 
       - name: Deploy to Pipecat Cloud
         working-directory: agent
         run: |
           pcc deploy \
-            --image "${{ secrets.DOCKERHUB_USERNAME }}/summit-realty-ava:${{ github.sha }}" \
-            --credentials "${{ secrets.DOCKERHUB_USERNAME }}" \
-            -f pcc-deploy.toml
+            realtime-voiceai-demo \
+            "${{ secrets.DOCKERHUB_USERNAME }}/summit-realty-ava:${{ github.sha }}" \
+            --credentials "${{ secrets.DOCKERHUB_IMAGE_PULL_SECRET }}" \
+            --config-file pcc-deploy.toml

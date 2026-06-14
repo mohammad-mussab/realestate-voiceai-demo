@@ -47,6 +47,7 @@ jobs:
       - name: Authenticate with Pipecat Cloud
         run: |
           echo "${{ secrets.PIPECAT_CLOUD_API_TOKEN }}" | pcc auth use-pat
+          pcc organizations select -o mohammadmussab
           pcc auth whoami | grep -q invictusblaze7@gmail.com
 
       - name: Deploy to Pipecat Cloud
@@ -57,5 +58,7 @@ jobs:
             "${{ secrets.DOCKERHUB_USERNAME }}/summit-realty-ava:${{ github.sha }}" \
             --credentials "${{ secrets.DOCKERHUB_IMAGE_PULL_SECRET }}" \
             --config-file pcc-deploy.toml \
+            -o mohammadmussab \
+            -y \
             2>&1 | tee /tmp/pcc-deploy.log
           ! grep -q "ᓚᘏᗢ Error" /tmp/pcc-deploy.log

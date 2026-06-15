@@ -20,12 +20,14 @@ async def check_area(params: FunctionCallParams, area: str):
     Args:
         area: City, neighborhood, or ZIP code the lead mentioned.
     """
-    logger.info(f"[check_area] area={area} -> covered")
-    await params.result_callback({"covered": True, "area": area})
+    out_of_area_terms = ("ottawa", "montreal", "vancouver", "calgary", "edmonton")
+    covered = not any(term in area.lower() for term in out_of_area_terms)
+    logger.info(f"[check_area] area={area} -> covered={covered}")
+    await params.result_callback({"covered": covered, "area": area})
 
 
 async def check_availability(params: FunctionCallParams, appointment_type: str, preferred_date: str = ""):
-    """Get available appointment slots for a showing, listing consultation, or call-back.
+    """Get available appointment slots before offering or booking any appointment time.
 
     Args:
         appointment_type: One of "showing", "listing_consultation", or "call_back".
@@ -50,7 +52,7 @@ async def book_appointment(
     appointment_time: str,
     notes: str = "",
 ):
-    """Book a showing, listing consultation, or call-back once details are confirmed.
+    """Book only after the chosen appointment_time was returned by check_availability.
 
     Args:
         name: Lead's full name.
@@ -87,7 +89,10 @@ async def alert_agent(
     reason: str,
     area: str = "",
 ):
-    """Alert the team right away about a hot, ready-to-move lead.
+    """Mandatory for hot leads once real name and phone are known.
+
+    Hot leads include pre-approved urgent buyers, buyers who may move quickly,
+    sellers who need to sell fast, and sellers relocating on a near-term deadline.
 
     Args:
         name: Lead's full name.
@@ -121,7 +126,7 @@ async def capture_lead(
     lead_type: str = "question",
     reason: str = "",
 ):
-    """Save the lead's contact details and intent. Call this on every call.
+    """Save lead details as soon as real name and phone are known. Call once per call.
 
     Args:
         phone: Best callback phone number, if known yet.
@@ -129,6 +134,16 @@ async def capture_lead(
         lead_type: One of "buyer", "seller", or "question".
         reason: Why a full booking wasn't made, if applicable.
     """
+    if not name and not phone:
+        logger.warning(f"capture_lead ignored empty contact details; lead_type={lead_type} reason={reason}")
+        await params.result_callback(
+            {
+                "captured": False,
+                "error": "name or phone is required before capture_lead",
+            }
+        )
+        return
+
     logger.info(f"LEAD CAPTURED\n  name: {name}\n  phone: {phone}\n  lead_type: {lead_type}\n  reason: {reason}")
     await params.result_callback({"captured": True})
 
@@ -142,7 +157,7 @@ async def qualify_lead(
     property_needs: str = "",
     seller_address: str = "",
 ):
-    """Record qualifying details for a buyer or seller lead.
+    """Record buyer/seller qualifying details once known; do not wait for booking.
 
     Args:
         timeline: e.g. "now", "1-3 months", or "just browsing".

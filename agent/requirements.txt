@@ -1,4 +1,4 @@
-pipecat-ai[google,webrtc,runner]
+pipecat-ai[deepgram,openai,cartesia,webrtc,runner]
 python-dotenv
 loguru
 twilio

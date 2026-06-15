@@ -1,7 +1,7 @@
 """Summit Realty Group demo voice agent.
 
 Browser-based demo using Pipecat's dev runner (WebRTC transport + prebuilt UI)
-and Google's Gemini Live voice-to-voice model.
+and a cascade voice pipeline: Deepgram Flux STT, OpenAI Chat LLM, and Cartesia TTS.
 
 Run with:
 
@@ -10,6 +10,7 @@ Run with:
 Then open http://localhost:7860/client and allow microphone access.
 """
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -35,8 +36,6 @@ from pipecat.frames.frames import (
     LLMRunFrame,
     TranscriptionFrame,
     TTSTextFrame,
-    UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.observers.loggers.transcription_log_observer import TranscriptionLogObserver
@@ -44,7 +43,10 @@ from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.runner.types import RunnerArguments, WebSocketRunnerArguments
 from pipecat.runner.utils import (
@@ -53,9 +55,13 @@ from pipecat.runner.utils import (
     create_transport,
     parse_telephony_websocket,
 )
-from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.tts_service import TextAggregationMode
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 import webhooks  # noqa: F401  (registers /webhooks/tally and /twiml/outbound routes)
@@ -111,6 +117,17 @@ def _build_krisp_filter():
         return None
 
 
+def _cartesia_text_aggregation_mode() -> TextAggregationMode:
+    mode = os.environ.get("CARTESIA_TEXT_AGGREGATION", "token").strip().lower()
+    if mode == "sentence":
+        return TextAggregationMode.SENTENCE
+    if mode != "token":
+        logger.warning(
+            f"Unsupported CARTESIA_TEXT_AGGREGATION={mode!r}; using token aggregation"
+        )
+    return TextAggregationMode.TOKEN
+
+
 transport_params = {
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
@@ -129,11 +146,12 @@ class CallSummaryObserver(BaseObserver):
     """Accumulates lead/qualification/booking details and the transcript from a call
     for end-of-call logging."""
 
-    def __init__(self, llm):
+    def __init__(self, stt, tts):
         super().__init__()
         self.summary: dict = {}
         self._transcript_chunks: list[tuple[str, str]] = []
-        self._llm = llm
+        self._stt = stt
+        self._tts = tts
 
     @property
     def transcript_lines(self) -> list[str]:
@@ -149,13 +167,13 @@ class CallSummaryObserver(BaseObserver):
     async def on_push_frame(self, data: FramePushed):
         frame = data.frame
 
-        # TranscriptionFrame/TTSTextFrame originate at the LLM service and are then
+        # TranscriptionFrame/TTSTextFrame originate at provider services and are then
         # re-pushed through several downstream processors, firing on_push_frame once
         # per hop. Only capture at the origin to avoid duplicate transcript lines.
-        if isinstance(frame, TranscriptionFrame) and data.source is self._llm:
+        if isinstance(frame, TranscriptionFrame) and data.source is self._stt:
             self._transcript_chunks.append(("Caller", f" {frame.text}"))
             return
-        if isinstance(frame, TTSTextFrame) and data.source is self._llm:
+        if isinstance(frame, TTSTextFrame) and data.source is self._tts:
             self._transcript_chunks.append(("Ava", frame.text))
             return
 
@@ -205,7 +223,7 @@ class CallSummaryObserver(BaseObserver):
 
 class ToolResultPushFix(BaseObserver):
     """Works around a pipecat bug where a function-call result that arrives while
-    the user is (briefly) flagged as speaking never gets pushed to Gemini Live,
+    the user is (briefly) flagged as speaking never gets pushed to the LLM,
     leaving the bot silent until an unrelated later turn happens to flush it.
 
     LLMAssistantAggregator only pushes the context frame containing the tool
@@ -218,34 +236,94 @@ class ToolResultPushFix(BaseObserver):
     def __init__(self, assistant_aggregator):
         super().__init__()
         self._assistant_aggregator = assistant_aggregator
-        self._user_speaking = False
-        self._pending_push = False
+        self._pending_tool_results: set[str] = set()
+        self._flush_task: asyncio.Task | None = None
 
     async def on_push_frame(self, data: FramePushed):
         frame = data.frame
-        if isinstance(frame, UserStartedSpeakingFrame):
-            self._user_speaking = True
-        elif isinstance(frame, UserStoppedSpeakingFrame):
-            self._user_speaking = False
-            if self._pending_push:
-                self._pending_push = False
-                logger.debug("ToolResultPushFix: flushing deferred context push")
-                await self._assistant_aggregator.push_context_frame(FrameDirection.UPSTREAM)
-        elif isinstance(frame, FunctionCallResultFrame) and self._user_speaking:
-            self._pending_push = True
+        if not isinstance(frame, FunctionCallResultFrame):
+            return
+
+        # Observers see each frame at every pipeline hop. Only react when the
+        # result is being delivered to the assistant aggregator, otherwise one
+        # tool result can trigger several duplicate LLM runs.
+        if data.destination is not self._assistant_aggregator:
+            return
+
+        if frame.tool_call_id in self._pending_tool_results:
+            return
+
+        self._pending_tool_results.add(frame.tool_call_id)
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._flush_when_safe())
+
+    async def _flush_when_safe(self):
+        # Let LLMAssistantAggregator handle the FunctionCallResultFrame first.
+        await asyncio.sleep(0.05)
+
+        if not getattr(self._assistant_aggregator, "_user_speaking", False):
+            self._pending_tool_results.clear()
+            return
+
+        max_wait_secs = float(os.environ.get("TOOL_RESULT_FLUSH_MAX_WAIT_SECS", "1.2"))
+        deadline = asyncio.get_running_loop().time() + max_wait_secs
+        while (
+            getattr(self._assistant_aggregator, "_user_speaking", False)
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.05)
+
+        pending = ", ".join(sorted(self._pending_tool_results))
+        if getattr(self._assistant_aggregator, "_user_speaking", False):
+            logger.warning(
+                f"ToolResultPushFix: forcing context push after {max_wait_secs:.1f}s "
+                f"with user still marked speaking; tool_call_ids={pending}"
+            )
+        else:
+            logger.debug(f"ToolResultPushFix: flushing deferred tool results; tool_call_ids={pending}")
+
+        self._pending_tool_results.clear()
+        await self._assistant_aggregator.push_context_frame(FrameDirection.UPSTREAM)
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_data: dict | None = None):
     _ensure_file_logging()
     logger.info("Starting Ava (Summit Realty Group demo)")
 
-    llm = GeminiLiveLLMService(
-        api_key=os.environ["GEMINI_API_KEY"],
-        settings=GeminiLiveLLMService.Settings(
-            model="models/gemini-3.1-flash-live-preview",
-            system_instruction=SYSTEM_INSTRUCTION,
-            voice=os.environ.get("AGENT_VOICE", "Aoede"),
+    deepgram_model = os.environ.get("DEEPGRAM_MODEL", "flux-general-en")
+    openai_model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+    cartesia_model = os.environ.get("CARTESIA_MODEL", "sonic-3.5")
+    cartesia_text_aggregation = _cartesia_text_aggregation_mode()
+
+    stt = DeepgramFluxSTTService(
+        api_key=os.environ["DEEPGRAM_API_KEY"],
+        settings=DeepgramFluxSTTService.Settings(
+            model=deepgram_model,
+            eager_eot_threshold=float(os.environ.get("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.5")),
+            eot_threshold=float(os.environ.get("DEEPGRAM_EOT_THRESHOLD", "0.8")),
         ),
+    )
+    llm = OpenAILLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAILLMService.Settings(
+            model=openai_model,
+            system_instruction=SYSTEM_INSTRUCTION,
+            temperature=float(os.environ.get("OPENAI_TEMPERATURE", "0.3")),
+            max_completion_tokens=int(os.environ.get("OPENAI_MAX_COMPLETION_TOKENS", "180")),
+        ),
+    )
+    tts = CartesiaTTSService(
+        api_key=os.environ["CARTESIA_API_KEY"],
+        text_aggregation_mode=cartesia_text_aggregation,
+        settings=CartesiaTTSService.Settings(
+            model=cartesia_model,
+            voice=os.environ["CARTESIA_VOICE_ID"],
+        ),
+    )
+    logger.info(
+        "Voice pipeline configured: "
+        f"Deepgram={deepgram_model}, OpenAI={openai_model}, "
+        f"Cartesia={cartesia_model}, Cartesia aggregation={cartesia_text_aggregation.value}"
     )
 
     for tool_fn in (
@@ -274,22 +352,29 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
             ]
         )
     )
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            user_turn_strategies=ExternalUserTurnStrategies(),
+        ),
+    )
 
     audio_buffer = AudioBufferProcessor(num_channels=2)
 
     pipeline = Pipeline(
         [
             transport.input(),
+            stt,
             user_aggregator,
             llm,
+            tts,
             transport.output(),
             audio_buffer,
             assistant_aggregator,
         ]
     )
 
-    call_summary_observer = CallSummaryObserver(llm)
+    call_summary_observer = CallSummaryObserver(stt, tts)
     tool_result_push_fix = ToolResultPushFix(assistant_aggregator)
 
     worker = PipelineWorker(

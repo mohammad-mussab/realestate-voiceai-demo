@@ -5,10 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Browser-based voice agent demo for "Summit Realty Group" (fictional real estate brokerage),
-built with [Pipecat](https://github.com/pipecat-ai/pipecat) and Google's Gemini Live API
-(`gemini-3.1-flash-live-preview`, voice-to-voice — no separate STT/TTS). The agent ("Ava")
-answers calls, qualifies buyer/seller leads, detects hot leads, and books showings/listing
-consultations.
+built with [Pipecat](https://github.com/pipecat-ai/pipecat) and a cascade voice pipeline:
+Deepgram Flux STT -> OpenAI Chat LLM -> Cartesia TTS. The agent ("Ava") answers calls,
+qualifies buyer/seller leads, detects hot leads, and books showings/listing consultations.
 
 ## Setup & run
 
@@ -18,7 +17,8 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env and set GEMINI_API_KEY (Twilio + Supabase vars optional)
+# edit .env and set DEEPGRAM_API_KEY, OPENAI_API_KEY, CARTESIA_API_KEY,
+# and CARTESIA_VOICE_ID (Twilio + Supabase vars optional)
 python bot.py
 ```
 
@@ -28,9 +28,9 @@ plus the automated scenario tests below.
 
 ## Automated scenario tests
 
-`agent/tests/` drives Ava through scripted text conversations against the real Gemini Live API
-(text input -> audio reply + transcription, no microphone needed), executes real tool calls
-against `tools.py`, and uses an LLM judge to grade each scenario pass/fail.
+`agent/tests/` drives Ava through scripted text conversations against OpenAI using the same
+prompt and tool functions as the voice bot, then uses an LLM judge to grade each scenario
+pass/fail.
 
 ```bash
 cd agent
@@ -47,12 +47,12 @@ not say, judge criteria).
 ## Architecture
 
 - `agent/bot.py` — entry point. Builds the Pipecat pipeline: WebRTC transport ->
-  `LLMContextAggregatorPair` -> `GeminiLiveLLMService` -> transport output. Registers all tool
-  functions on the LLM and in the `ToolsSchema`. On `on_client_connected`, injects a developer
-  message telling Ava to greet the caller and kicks off the pipeline with `LLMRunFrame()`. A
-  `CallSummaryObserver` accumulates lead/qualification/booking details from tool-call results
-  during the call; on `on_client_disconnected`, the accumulated summary is logged to Supabase
-  via `agent/db.py`.
+  `DeepgramFluxSTTService` -> `LLMContextAggregatorPair` -> `OpenAILLMService` ->
+  `CartesiaTTSService` -> transport output. Registers all tool functions on the LLM and in the
+  `ToolsSchema`. On `on_client_connected`, injects a developer message telling Ava to greet the
+  caller and kicks off the pipeline with `LLMRunFrame()`. A `CallSummaryObserver` accumulates
+  lead/qualification/booking details from tool-call results during the call; on
+  `on_client_disconnected`, the accumulated summary is logged to Supabase via `agent/db.py`.
 - `agent/prompts.py` — `SYSTEM_INSTRUCTION`, the full persona/behavior spec for Ava (identity,
   speaking style, buyer/seller qualifying flow, hot-lead detection, info-capture flow, booking
   flow, hard rules including fair housing, opening line). This is the primary "brain" of the

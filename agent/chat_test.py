@@ -1,10 +1,8 @@
-"""Text-chat dev harness for Ava (Summit Realty Group Gemini Live agent).
+"""Text-chat dev harness for Ava (Summit Realty Group OpenAI agent).
 
 A fast, text-only alternative to bot.py for iterating on prompts.py/tools.py.
-Opens a tiny local web UI (no audio, no microphone) backed by a persistent
-Gemini Live session per browser connection. Uses the same connect/send/receive
-pattern as tests/run_scenarios.py: text in, output_audio_transcription for
-text out, real tool calls against tools.py.
+Opens a tiny local web UI backed by OpenAI Chat Completions with the same prompt
+and tool functions used by the cascade voice bot.
 
 Usage:
     python chat_test.py
@@ -12,15 +10,15 @@ Usage:
 Then open http://localhost:7861/ in a browser.
 """
 
+import inspect
 import json
 import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from google import genai
-from google.genai import types
 from loguru import logger
+from openai import AsyncOpenAI
 
 from prompts import SYSTEM_INSTRUCTION
 from tools import (
@@ -35,11 +33,11 @@ from tools import (
 )
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
+from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter
 
 load_dotenv(override=True)
 
-LIVE_MODEL = "gemini-3.1-flash-live-preview"
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 TOOL_FUNCTIONS = {
     fn.__name__: fn
@@ -57,11 +55,7 @@ TOOL_FUNCTIONS = {
 
 
 class _FakeFunctionCallParams:
-    """Minimal stand-in for pipecat's FunctionCallParams.
-
-    tools.py functions only use .result_callback(...) — they don't read .arguments
-    off this object (arguments are passed as kwargs), so this just captures the result.
-    """
+    """Minimal stand-in for pipecat's FunctionCallParams."""
 
     def __init__(self):
         self.result = None
@@ -83,7 +77,7 @@ def build_tools_config():
             send_confirmation_sms,
         ]
     )
-    return GeminiLLMAdapter().to_provider_tools_format(tools_schema)
+    return OpenAILLMAdapter().to_provider_tools_format(tools_schema)
 
 
 async def call_tool(name: str, args: dict) -> dict:
@@ -92,25 +86,16 @@ async def call_tool(name: str, args: dict) -> dict:
         logger.warning(f"Unknown tool called by model: {name}")
         return {"error": f"unknown tool {name}"}
 
+    signature = inspect.signature(fn)
+    allowed_args = {key for key in signature.parameters if key != "params"}
+    extra_args = sorted(set(args) - allowed_args)
+    if extra_args:
+        logger.warning(f"Ignoring extra args for {name}: {extra_args}")
+    filtered_args = {key: value for key, value in args.items() if key in allowed_args}
+
     params = _FakeFunctionCallParams()
-    await fn(params, **args)
+    await fn(params, **filtered_args)
     return params.result if params.result is not None else {}
-
-
-def build_live_config() -> types.LiveConnectConfig:
-    return types.LiveConnectConfig(
-        system_instruction=SYSTEM_INSTRUCTION,
-        response_modalities=["AUDIO"],
-        output_audio_transcription={},
-        tools=build_tools_config(),
-        speech_config=types.SpeechConfig(
-            voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                    voice_name=os.environ.get("AGENT_VOICE", "Charon")
-                )
-            )
-        ),
-    )
 
 
 app = FastAPI()
@@ -193,60 +178,84 @@ async def index():
     return HTMLResponse(CHAT_HTML)
 
 
+def _tool_message(tool_call, result: dict) -> dict:
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "content": json.dumps(result),
+    }
+
+
+async def complete_turn(client: AsyncOpenAI, websocket: WebSocket, messages: list[dict], tools: list[dict]) -> str:
+    while True:
+        response = await client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=float(os.environ.get("OPENAI_TEMPERATURE", "0.3")),
+            max_completion_tokens=int(os.environ.get("OPENAI_MAX_COMPLETION_TOKENS", "180")),
+        )
+        message = response.choices[0].message
+
+        if message.tool_calls:
+            messages.append(message.model_dump(exclude_none=True))
+            for tool_call in message.tool_calls:
+                args = json.loads(tool_call.function.arguments or "{}")
+                result = await call_tool(tool_call.function.name, args)
+                logger.info(f"[tool_call] {tool_call.function.name}({args}) -> {result}")
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "tool_call",
+                            "name": tool_call.function.name,
+                            "args": args,
+                            "result": result,
+                        }
+                    )
+                )
+                messages.append(_tool_message(tool_call, result))
+            continue
+
+        reply = message.content or ""
+        messages.append({"role": "assistant", "content": reply})
+        return reply
+
+
 @app.websocket("/ws")
 async def chat_ws(websocket: WebSocket):
     await websocket.accept()
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        await websocket.send_text(json.dumps({"type": "status", "text": "GEMINI_API_KEY not set"}))
+        await websocket.send_text(json.dumps({"type": "status", "text": "OPENAI_API_KEY not set"}))
         await websocket.close()
         return
 
-    client = genai.Client(api_key=api_key)
-    config = build_live_config()
+    client = AsyncOpenAI(api_key=api_key)
+    tools = build_tools_config()
+    messages = [
+        {"role": "system", "content": SYSTEM_INSTRUCTION},
+        {"role": "developer", "content": "Greet the caller with your opening line now."},
+    ]
 
     try:
-        async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
-            await websocket.send_text(json.dumps({"type": "status", "text": "connected"}))
+        await websocket.send_text(json.dumps({"type": "status", "text": f"connected ({DEFAULT_MODEL})"}))
+        opening = await complete_turn(client, websocket, messages, tools)
+        if opening:
+            await websocket.send_text(json.dumps({"type": "reply", "text": opening}))
 
-            while True:
-                raw = await websocket.receive_text()
-                data = json.loads(raw)
-                user_text = data.get("text", "")
-                if not user_text:
-                    continue
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+            user_text = data.get("text", "")
+            if not user_text:
+                continue
 
-                await session.send_client_content(
-                    turns=types.Content(role="user", parts=[types.Part(text=user_text)]),
-                    turn_complete=True,
-                )
-
-                reply_text = ""
-                async for message in session.receive():
-                    if message.server_content:
-                        sc = message.server_content
-                        if sc.output_transcription and sc.output_transcription.text:
-                            reply_text += sc.output_transcription.text
-                        if sc.turn_complete:
-                            break
-
-                    if message.tool_call:
-                        responses = []
-                        for fc in message.tool_call.function_calls:
-                            args = dict(fc.args or {})
-                            result = await call_tool(fc.name, args)
-                            logger.info(f"[tool_call] {fc.name}({args}) -> {result}")
-                            await websocket.send_text(
-                                json.dumps({"type": "tool_call", "name": fc.name, "args": args, "result": result})
-                            )
-                            responses.append(
-                                types.FunctionResponse(name=fc.name, id=fc.id, response=result)
-                            )
-                        await session.send_tool_response(function_responses=responses)
-
-                if reply_text:
-                    await websocket.send_text(json.dumps({"type": "reply", "text": reply_text}))
+            messages.append({"role": "user", "content": user_text})
+            reply = await complete_turn(client, websocket, messages, tools)
+            if reply:
+                await websocket.send_text(json.dumps({"type": "reply", "text": reply}))
     except WebSocketDisconnect:
         logger.info("Chat client disconnected")
 

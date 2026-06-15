@@ -16,7 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from loguru import logger
 
-from db import log_call
+from db import audio_to_wav, log_call, upload_recording
 from prompts import SYSTEM_INSTRUCTION
 from tools import (
     alert_agent,
@@ -33,11 +33,14 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
     FunctionCallResultFrame,
     LLMRunFrame,
+    TranscriptionFrame,
+    TTSTextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.observers.loggers.transcription_log_observer import TranscriptionLogObserver
+from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -59,14 +62,29 @@ import webhooks  # noqa: F401  (registers /webhooks/tally and /twiml/outbound ro
 
 load_dotenv(override=True)
 
-logs_dir = Path(__file__).parent / "logs"
-logs_dir.mkdir(exist_ok=True)
-logger.add(
-    logs_dir / "bot_{time:YYYY-MM-DD}.log",
-    level="DEBUG",
-    rotation="00:00",
-    retention="14 days",
-)
+_file_logging_configured = False
+
+
+def _ensure_file_logging():
+    """Add the DEBUG file sink, once per process.
+
+    Must happen lazily (not at module import time): pipecat's runner `main()`
+    calls `logger.remove()` during startup, which would strip a sink added at
+    import time before the server ever starts.
+    """
+    global _file_logging_configured
+    if _file_logging_configured:
+        return
+    logs_dir = Path(__file__).parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    logger.add(
+        logs_dir / "bot_{time:YYYY-MM-DD}.log",
+        level="DEBUG",
+        rotation="00:00",
+        retention="14 days",
+    )
+    _file_logging_configured = True
+
 
 def _build_krisp_filter():
     """Return a KrispVivaFilter if KRISP_VIVA_* env vars are configured, else None.
@@ -108,14 +126,39 @@ transport_params = {
 
 
 class CallSummaryObserver(BaseObserver):
-    """Accumulates lead/qualification/booking details from tool calls for end-of-call logging."""
+    """Accumulates lead/qualification/booking details and the transcript from a call
+    for end-of-call logging."""
 
-    def __init__(self):
+    def __init__(self, llm):
         super().__init__()
         self.summary: dict = {}
+        self._transcript_chunks: list[tuple[str, str]] = []
+        self._llm = llm
+
+    @property
+    def transcript_lines(self) -> list[str]:
+        """Merge consecutive same-speaker chunks into one line per turn."""
+        lines: list[str] = []
+        for speaker, text in self._transcript_chunks:
+            if lines and lines[-1].startswith(f"{speaker}:"):
+                lines[-1] += text
+            else:
+                lines.append(f"{speaker}:{text}")
+        return lines
 
     async def on_push_frame(self, data: FramePushed):
         frame = data.frame
+
+        # TranscriptionFrame/TTSTextFrame originate at the LLM service and are then
+        # re-pushed through several downstream processors, firing on_push_frame once
+        # per hop. Only capture at the origin to avoid duplicate transcript lines.
+        if isinstance(frame, TranscriptionFrame) and data.source is self._llm:
+            self._transcript_chunks.append(("Caller", f" {frame.text}"))
+            return
+        if isinstance(frame, TTSTextFrame) and data.source is self._llm:
+            self._transcript_chunks.append(("Ava", frame.text))
+            return
+
         if not isinstance(frame, FunctionCallResultFrame):
             return
 
@@ -193,6 +236,7 @@ class ToolResultPushFix(BaseObserver):
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_data: dict | None = None):
+    _ensure_file_logging()
     logger.info("Starting Ava (Summit Realty Group demo)")
 
     llm = GeminiLiveLLMService(
@@ -200,7 +244,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
         settings=GeminiLiveLLMService.Settings(
             model="models/gemini-3.1-flash-live-preview",
             system_instruction=SYSTEM_INSTRUCTION,
-            voice=os.environ.get("AGENT_VOICE", "Charon"),
+            voice=os.environ.get("AGENT_VOICE", "Aoede"),
         ),
     )
 
@@ -232,17 +276,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
     )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
 
+    audio_buffer = AudioBufferProcessor(num_channels=2)
+
     pipeline = Pipeline(
         [
             transport.input(),
             user_aggregator,
             llm,
             transport.output(),
+            audio_buffer,
             assistant_aggregator,
         ]
     )
 
-    call_summary_observer = CallSummaryObserver()
+    call_summary_observer = CallSummaryObserver(llm)
     tool_result_push_fix = ToolResultPushFix(assistant_aggregator)
 
     worker = PipelineWorker(
@@ -255,9 +302,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
         observers=[TranscriptionLogObserver(), call_summary_observer, tool_result_push_fix],
     )
 
+    recorded_audio: dict = {}
+
+    @audio_buffer.event_handler("on_audio_data")
+    async def on_audio_data(buffer, audio, sample_rate, num_channels):
+        logger.debug(f"on_audio_data fired: {len(audio)} bytes, sample_rate={sample_rate}, channels={num_channels}")
+        recorded_audio["audio"] = audio
+        recorded_audio["sample_rate"] = sample_rate
+        recorded_audio["num_channels"] = num_channels
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
+        await audio_buffer.start_recording()
+        logger.debug(f"audio_buffer recording started, sample_rate={audio_buffer.sample_rate}")
         call_body = (call_data or {}).get("body") or {}
         if call_body.get("call_type") == "outbound_demo":
             lead_name = call_body.get("lead_name", "there")
@@ -279,8 +337,27 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Client disconnected")
-        if call_summary_observer.summary:
-            log_call(call_summary_observer.summary)
+        logger.debug(
+            f"Before stop_recording: user_buffer={len(audio_buffer._user_audio_buffer)} bytes, "
+            f"bot_buffer={len(audio_buffer._bot_audio_buffer)} bytes, "
+            f"sample_rate={audio_buffer.sample_rate}, recording={audio_buffer._recording}"
+        )
+        await audio_buffer.stop_recording()
+        logger.debug(f"recorded_audio after stop: {bool(recorded_audio.get('audio'))}")
+        if call_summary_observer.summary or call_summary_observer.transcript_lines:
+            summary = dict(call_summary_observer.summary)
+            if call_summary_observer.transcript_lines:
+                summary["transcript"] = "\n".join(call_summary_observer.transcript_lines)
+            if recorded_audio.get("audio"):
+                wav_bytes = audio_to_wav(
+                    recorded_audio["audio"],
+                    recorded_audio["sample_rate"],
+                    recorded_audio["num_channels"],
+                )
+                recording = upload_recording(wav_bytes)
+                if recording.get("url"):
+                    summary["recording_url"] = recording["url"]
+            log_call(summary)
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)

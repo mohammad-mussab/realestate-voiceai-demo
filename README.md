@@ -50,6 +50,11 @@ endpoint. Configure these env vars for outbound calls:
 - `TWILIO_AUTH_TOKEN`
 - `TWILIO_FROM_NUMBER`
 - `PUBLIC_SERVER_URL`
+- `DEFAULT_COUNTRY_CODE=+1`
+- `BLOCKED_OUTBOUND_COUNTRY_CODES=+91,+92,+977,+880`
+
+By default, outbound demo calls are blocked for India, Pakistan, Nepal, and
+Bangladesh phone numbers before Twilio is called.
 
 ## Tests
 

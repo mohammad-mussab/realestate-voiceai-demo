@@ -22,6 +22,7 @@ load_dotenv()
 app = FastAPI()
 
 PHONE_RE = re.compile(r"[\d+]")
+DEFAULT_BLOCKED_OUTBOUND_COUNTRY_CODES = ("+91", "+92", "+977", "+880")
 
 
 def extract_lead_from_tally(payload: dict) -> dict:
@@ -80,8 +81,30 @@ def _normalize_phone(phone: str) -> str:
     return f"{default_country_code}{digits}"
 
 
+def _blocked_outbound_country_codes() -> tuple[str, ...]:
+    """Return country codes that should not receive outbound demo calls."""
+    raw_codes = os.environ.get("BLOCKED_OUTBOUND_COUNTRY_CODES")
+    if not raw_codes:
+        return DEFAULT_BLOCKED_OUTBOUND_COUNTRY_CODES
+    return tuple(code.strip() for code in raw_codes.split(",") if code.strip())
+
+
+def is_outbound_phone_blocked(phone: str) -> bool:
+    """Return True when the normalized phone starts with a blocked country code."""
+    return phone.startswith(_blocked_outbound_country_codes())
+
+
 async def trigger_outbound_call(name: str | None, phone: str) -> dict:
     """Place an outbound Twilio call to a lead, or log if Twilio isn't configured."""
+    if is_outbound_phone_blocked(phone):
+        logger.info(f"[outbound call - BLOCKED by country code] to={phone} name={name}")
+        return {
+            "called": False,
+            "sid": None,
+            "error": "Blocked country code",
+            "blocked": True,
+        }
+
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
     from_number = os.environ.get("TWILIO_FROM_NUMBER")
@@ -115,11 +138,13 @@ async def tally_webhook(request: Request):
 
     lead = extract_lead_from_tally(payload)
     called = False
+    blocked = False
     if lead["phone"]:
         result = await trigger_outbound_call(lead["name"], lead["phone"])
         called = result["called"]
+        blocked = result.get("blocked", False)
 
-    return {"received": True, "called": called}
+    return {"received": True, "called": called, "blocked": blocked}
 
 
 @app.get("/twiml/outbound")

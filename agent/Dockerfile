@@ -9,3 +9,4 @@ COPY ./tools.py tools.py
 COPY ./sms.py sms.py
 COPY ./db.py db.py
 COPY ./webhooks.py webhooks.py
+COPY ./call_analysis.py call_analysis.py

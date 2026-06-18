@@ -118,7 +118,10 @@ async def trigger_outbound_call(name: str | None, phone: str) -> dict:
         from twilio.rest import Client
 
         client = Client(account_sid, auth_token)
-        twiml_url = f"{public_server_url}/twiml/outbound?name={quote(name or 'there')}"
+        twiml_url = (
+            f"{public_server_url}/twiml/outbound"
+            f"?name={quote(name or 'there')}&phone={quote(phone)}"
+        )
         call = client.calls.create(to=phone, from_=from_number, url=twiml_url, method="GET")
         logger.info(f"[outbound call placed] sid={call.sid} to={phone} name={name}")
         return {"called": True, "sid": call.sid, "error": None}
@@ -146,11 +149,12 @@ async def tally_webhook(request: Request):
 
 @app.get("/twiml/outbound")
 @app.post("/twiml/outbound")
-async def twiml_outbound(name: str = "there"):
+async def twiml_outbound(name: str = "there", phone: str = ""):
     """Return TwiML that connects an outbound call's media stream to /ws."""
     public_server_url = os.environ.get("PUBLIC_SERVER_URL", "")
     ws_host = re.sub(r"^https?://", "", public_server_url)
     safe_name = escape(name)
+    safe_phone = escape(phone)
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -158,6 +162,7 @@ async def twiml_outbound(name: str = "there"):
     <Stream url="wss://{ws_host}/ws">
       <Parameter name="call_type" value="outbound_demo"/>
       <Parameter name="lead_name" value="{safe_name}"/>
+      <Parameter name="lead_phone" value="{safe_phone}"/>
     </Stream>
   </Connect>
   <Pause length="40"/>

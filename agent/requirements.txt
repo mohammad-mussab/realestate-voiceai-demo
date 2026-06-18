@@ -1,8 +1,9 @@
-pipecat-ai[deepgram,openai,cartesia,webrtc,runner]
+pipecat-ai[deepgram,openai,cartesia,elevenlabs,webrtc,runner]
 python-dotenv
 loguru
 twilio
 supabase
+google-genai
 
 # Optional: krisp_audio (proprietary, requires a Krisp license) — only needed if
 # KRISP_VIVA_API_KEY / KRISP_VIVA_FILTER_MODEL_PATH are set in .env.

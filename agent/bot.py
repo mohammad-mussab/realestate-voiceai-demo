@@ -12,11 +12,13 @@ Then open http://localhost:7860/client and allow microphone access.
 
 import asyncio
 import os
+import random
 from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
 
+from call_analysis import analyze_call
 from db import audio_to_wav, log_call, upload_recording
 from prompts import SYSTEM_INSTRUCTION
 from tools import (
@@ -32,12 +34,17 @@ from tools import (
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
     FunctionCallResultFrame,
+    FunctionCallsStartedFrame,
     LLMRunFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
     TTSTextFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.loggers.transcription_log_observer import TranscriptionLogObserver
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.pipeline.pipeline import Pipeline
@@ -57,6 +64,7 @@ from pipecat.runner.utils import (
 )
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.tts_service import TextAggregationMode
 from pipecat.transports.base_transport import BaseTransport, TransportParams
@@ -117,15 +125,91 @@ def _build_krisp_filter():
         return None
 
 
-def _cartesia_text_aggregation_mode() -> TextAggregationMode:
-    mode = os.environ.get("CARTESIA_TEXT_AGGREGATION", "token").strip().lower()
+def _text_aggregation_mode(env_var: str) -> TextAggregationMode:
+    mode = os.environ.get(env_var, "token").strip().lower()
     if mode == "sentence":
         return TextAggregationMode.SENTENCE
     if mode != "token":
-        logger.warning(
-            f"Unsupported CARTESIA_TEXT_AGGREGATION={mode!r}; using token aggregation"
-        )
+        logger.warning(f"Unsupported {env_var}={mode!r}; using token aggregation")
     return TextAggregationMode.TOKEN
+
+
+def _build_cartesia_service() -> tuple[CartesiaTTSService, str]:
+    model = os.environ.get("CARTESIA_MODEL", "sonic-3.5")
+    text_aggregation = _text_aggregation_mode("CARTESIA_TEXT_AGGREGATION")
+    tts = CartesiaTTSService(
+        api_key=os.environ["CARTESIA_API_KEY"],
+        text_aggregation_mode=text_aggregation,
+        settings=CartesiaTTSService.Settings(
+            model=model,
+            voice=os.environ["CARTESIA_VOICE_ID"],
+        ),
+    )
+    return tts, f"Cartesia={model} (aggregation={text_aggregation.value})"
+
+
+async def _elevenlabs_has_quota(api_key: str) -> bool:
+    """Check the ElevenLabs key is valid and has characters remaining.
+
+    Hits GET /v1/user/subscription — cheap, no audio generated. Returns False (and logs why)
+    on any auth/quota/network failure so the caller can fall back to Cartesia.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                "https://api.elevenlabs.io/v1/user/subscription",
+                headers={"xi-api-key": api_key},
+            )
+        if response.status_code == 401:
+            logger.warning("ElevenLabs pre-flight check failed: invalid API key")
+            return False
+        response.raise_for_status()
+        data = response.json()
+        used = data.get("character_count", 0)
+        limit = data.get("character_limit", 0)
+        if limit and used >= limit:
+            logger.warning(f"ElevenLabs pre-flight check failed: quota exhausted ({used}/{limit} characters)")
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"ElevenLabs pre-flight check failed: {e}")
+        return False
+
+
+async def _build_tts_service() -> tuple[CartesiaTTSService | ElevenLabsTTSService, str]:
+    """Build the configured TTS service. Switch providers via TTS_PROVIDER=cartesia|elevenlabs.
+
+    Falls back to Cartesia if ElevenLabs is selected but its API key is invalid or its quota
+    is exhausted, so a demo call never fails outright over a TTS credit issue.
+
+    Returns (service, description) where description is a short string for the startup log.
+    """
+    provider = os.environ.get("TTS_PROVIDER", "cartesia").strip().lower()
+
+    if provider == "elevenlabs":
+        api_key = os.environ["ELEVENLABS_API_KEY"]
+        if await _elevenlabs_has_quota(api_key):
+            model = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5")
+            text_aggregation = _text_aggregation_mode("ELEVENLABS_TEXT_AGGREGATION")
+            tts = ElevenLabsTTSService(
+                api_key=api_key,
+                text_aggregation_mode=text_aggregation,
+                settings=ElevenLabsTTSService.Settings(
+                    model=model,
+                    voice=os.environ["ELEVENLABS_VOICE_ID"],
+                ),
+            )
+            return tts, f"ElevenLabs={model} (aggregation={text_aggregation.value})"
+
+        logger.warning("Falling back to Cartesia for this call")
+        return _build_cartesia_service()
+
+    if provider != "cartesia":
+        logger.warning(f"Unsupported TTS_PROVIDER={provider!r}; using cartesia")
+
+    return _build_cartesia_service()
 
 
 transport_params = {
@@ -143,26 +227,41 @@ transport_params = {
 
 
 class CallSummaryObserver(BaseObserver):
-    """Accumulates lead/qualification/booking details and the transcript from a call
-    for end-of-call logging."""
+    """Captures the transcript and booking_id from a call for end-of-call logging.
+
+    Lead/qualification fields are no longer accumulated from tool-call args here —
+    they're extracted from the transcript by call_analysis.analyze_call() instead, so a
+    call that gets cut off mid-flow (before capture_lead/qualify_lead fire) still yields
+    a populated call_logs row.
+    """
 
     def __init__(self, stt, tts):
         super().__init__()
-        self.summary: dict = {}
+        self.booking_id: str | None = None
         self._transcript_chunks: list[tuple[str, str]] = []
         self._stt = stt
         self._tts = tts
 
     @property
     def transcript_lines(self) -> list[str]:
-        """Merge consecutive same-speaker chunks into one line per turn."""
-        lines: list[str] = []
+        """Merge consecutive same-speaker chunks into one line per turn.
+
+        TTSTextFrame chunking granularity (single word vs sentence vs arbitrary token)
+        varies by TTS provider/aggregation mode, and chunks aren't guaranteed to carry
+        their own whitespace. Track per-speaker text separately from a prefix and join
+        chunks with a space, collapsing any doubled-up whitespace from a frame that did
+        include its own leading/trailing space.
+        """
+        lines: list[tuple[str, str]] = []
         for speaker, text in self._transcript_chunks:
-            if lines and lines[-1].startswith(f"{speaker}:"):
-                lines[-1] += text
+            text = text.strip()
+            if not text:
+                continue
+            if lines and lines[-1][0] == speaker:
+                lines[-1] = (speaker, f"{lines[-1][1]} {text}")
             else:
-                lines.append(f"{speaker}:{text}")
-        return lines
+                lines.append((speaker, text))
+        return [f"{speaker}: {text}" for speaker, text in lines]
 
     async def on_push_frame(self, data: FramePushed):
         frame = data.frame
@@ -171,54 +270,14 @@ class CallSummaryObserver(BaseObserver):
         # re-pushed through several downstream processors, firing on_push_frame once
         # per hop. Only capture at the origin to avoid duplicate transcript lines.
         if isinstance(frame, TranscriptionFrame) and data.source is self._stt:
-            self._transcript_chunks.append(("Caller", f" {frame.text}"))
+            self._transcript_chunks.append(("Caller", frame.text))
             return
         if isinstance(frame, TTSTextFrame) and data.source is self._tts:
             self._transcript_chunks.append(("Ava", frame.text))
             return
 
-        if not isinstance(frame, FunctionCallResultFrame):
-            return
-
-        args = frame.arguments or {}
-        result = frame.result or {}
-
-        if frame.function_name == "capture_lead":
-            self.summary.update(
-                lead_phone=args.get("phone"),
-                lead_name=args.get("name"),
-                lead_type=args.get("lead_type"),
-            )
-            if args.get("reason"):
-                self.summary["notes"] = args["reason"]
-        elif frame.function_name == "qualify_lead":
-            self.summary.update(
-                timeline=args.get("timeline"),
-                area=args.get("area"),
-                price_range=args.get("price_range"),
-                pre_approved=args.get("pre_approved"),
-                property_needs=args.get("property_needs"),
-                seller_address=args.get("seller_address"),
-            )
-        elif frame.function_name == "book_appointment":
-            self.summary.update(
-                lead_name=args.get("name"),
-                lead_phone=args.get("phone"),
-                appointment_type=args.get("appointment_type"),
-                appointment_time=args.get("appointment_time"),
-                booking_id=result.get("booking_id"),
-            )
-            if args.get("notes"):
-                self.summary["notes"] = args["notes"]
-        elif frame.function_name == "alert_agent":
-            self.summary.update(
-                lead_name=args.get("name"),
-                lead_phone=args.get("phone"),
-                hot_lead=True,
-                notes=args.get("reason"),
-            )
-            if args.get("area"):
-                self.summary["area"] = args["area"]
+        if isinstance(frame, FunctionCallResultFrame) and frame.function_name == "book_appointment":
+            self.booking_id = (frame.result or {}).get("booking_id")
 
 
 class ToolResultPushFix(BaseObserver):
@@ -286,21 +345,83 @@ class ToolResultPushFix(BaseObserver):
         await self._assistant_aggregator.push_context_frame(FrameDirection.UPSTREAM)
 
 
+# Tools whose result takes a second round-trip to the LLM before Ava can speak again
+# get a short spoken filler the instant the call starts, so the caller hears something
+# instead of dead air during that gap. Excluded:
+# - qualify_lead/capture_lead: silent bookkeeping the caller never consciously waits on.
+# - alert_agent: almost always fires bundled with capture_lead in the same turn as the
+#   phone readback (see prompts.py BOOKING step 5) — its filler would run on directly
+#   into that readback with no gap, since there's no separate LLM turn in between.
+TOOL_FILLERS = {
+    "check_area": ["Let me check that area.", "One second, checking that.", "Let's see."],
+    "check_availability": ["Let me check what's open.", "One second, checking the calendar."],
+    "book_appointment": ["Got it, booking that now.", "Okay, locking that in."],
+    "transfer_to_human": ["Of course, one moment.", "Sure, connecting you now."],
+}
+
+
+class ToolFillerSpeech(BaseObserver):
+    """Speaks a short filler line the instant a slow tool call starts, so the caller
+    hears something during the gap before the tool result + follow-up LLM call land.
+    """
+
+    def __init__(self, llm):
+        super().__init__()
+        self._llm = llm
+
+    async def on_push_frame(self, data: FramePushed):
+        frame = data.frame
+        if not isinstance(frame, FunctionCallsStartedFrame):
+            return
+        # FunctionCallsStartedFrame is broadcast both upstream and downstream from
+        # the LLM service; only react once, on the downstream copy.
+        if data.source is not self._llm or data.direction != FrameDirection.DOWNSTREAM:
+            return
+
+        for call in frame.function_calls:
+            fillers = TOOL_FILLERS.get(call.function_name)
+            if fillers:
+                await self._llm.push_frame(TTSSpeakFrame(random.choice(fillers)))
+
+
+class LatencyObserver(BaseObserver):
+    """Logs one plain-English line per turn: how long from the caller going silent
+    to Ava's voice actually starting. This is the end-to-end number that matches what
+    a caller perceives as "dead air" — everything else (STT/LLM/TTS TTFB) is a
+    breakdown of what makes up this total, visible via MetricsLogObserver instead.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._stopped_speaking_at: float | None = None
+
+    async def on_push_frame(self, data: FramePushed):
+        frame = data.frame
+        loop = asyncio.get_running_loop()
+
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            self._stopped_speaking_at = loop.time()
+            return
+
+        if isinstance(frame, BotStartedSpeakingFrame) and self._stopped_speaking_at is not None:
+            latency = loop.time() - self._stopped_speaking_at
+            self._stopped_speaking_at = None
+            logger.info(f"RESPONSE LATENCY: {latency:.2f}s (caller stopped talking -> Ava started speaking)")
+
+
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_data: dict | None = None):
     _ensure_file_logging()
     logger.info("Starting Ava (Summit Realty Group demo)")
 
     deepgram_model = os.environ.get("DEEPGRAM_MODEL", "flux-general-en")
     openai_model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
-    cartesia_model = os.environ.get("CARTESIA_MODEL", "sonic-3.5")
-    cartesia_text_aggregation = _cartesia_text_aggregation_mode()
 
     stt = DeepgramFluxSTTService(
         api_key=os.environ["DEEPGRAM_API_KEY"],
         settings=DeepgramFluxSTTService.Settings(
             model=deepgram_model,
             eager_eot_threshold=float(os.environ.get("DEEPGRAM_EAGER_EOT_THRESHOLD", "0.5")),
-            eot_threshold=float(os.environ.get("DEEPGRAM_EOT_THRESHOLD", "0.8")),
+            eot_threshold=float(os.environ.get("DEEPGRAM_EOT_THRESHOLD", "0.7")),
         ),
     )
     llm = OpenAILLMService(
@@ -308,22 +429,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
         settings=OpenAILLMService.Settings(
             model=openai_model,
             system_instruction=SYSTEM_INSTRUCTION,
-            temperature=float(os.environ.get("OPENAI_TEMPERATURE", "0.3")),
+            temperature=float(os.environ.get("OPENAI_TEMPERATURE", "0.5")),
             max_completion_tokens=int(os.environ.get("OPENAI_MAX_COMPLETION_TOKENS", "180")),
         ),
     )
-    tts = CartesiaTTSService(
-        api_key=os.environ["CARTESIA_API_KEY"],
-        text_aggregation_mode=cartesia_text_aggregation,
-        settings=CartesiaTTSService.Settings(
-            model=cartesia_model,
-            voice=os.environ["CARTESIA_VOICE_ID"],
-        ),
-    )
+    tts, tts_description = await _build_tts_service()
     logger.info(
         "Voice pipeline configured: "
-        f"Deepgram={deepgram_model}, OpenAI={openai_model}, "
-        f"Cartesia={cartesia_model}, Cartesia aggregation={cartesia_text_aggregation.value}"
+        f"Deepgram={deepgram_model}, OpenAI={openai_model}, {tts_description}"
     )
 
     for tool_fn in (
@@ -376,6 +489,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
 
     call_summary_observer = CallSummaryObserver(stt, tts)
     tool_result_push_fix = ToolResultPushFix(assistant_aggregator)
+    tool_filler_speech = ToolFillerSpeech(llm)
 
     worker = PipelineWorker(
         pipeline,
@@ -384,7 +498,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
             enable_usage_metrics=True,
         ),
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
-        observers=[TranscriptionLogObserver(), call_summary_observer, tool_result_push_fix],
+        observers=[
+            TranscriptionLogObserver(),
+            MetricsLogObserver(),
+            LatencyObserver(),
+            call_summary_observer,
+            tool_result_push_fix,
+            tool_filler_speech,
+        ],
     )
 
     recorded_audio: dict = {}
@@ -404,12 +525,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
         call_body = (call_data or {}).get("body") or {}
         if call_body.get("call_type") == "outbound_demo":
             lead_name = call_body.get("lead_name", "there")
+            lead_phone = call_body.get("lead_phone", "")
             context.add_message(
                 {
                     "role": "developer",
                     "content": (
-                        f"This is an outbound demo call you placed to {lead_name}. "
-                        f"Greet them by name as described for outbound demo calls now."
+                        f"This is an outbound demo call you placed to {lead_name} at "
+                        f"{lead_phone or 'an unknown number'}, using the name and phone "
+                        f"number they submitted on the website form. Greet them by name as "
+                        f"described for outbound demo calls, then verify (don't re-ask from "
+                        f"scratch) that name and phone number as described for outbound "
+                        f"demo calls."
                     ),
                 }
             )
@@ -429,10 +555,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, call_d
         )
         await audio_buffer.stop_recording()
         logger.debug(f"recorded_audio after stop: {bool(recorded_audio.get('audio'))}")
-        if call_summary_observer.summary or call_summary_observer.transcript_lines:
-            summary = dict(call_summary_observer.summary)
-            if call_summary_observer.transcript_lines:
-                summary["transcript"] = "\n".join(call_summary_observer.transcript_lines)
+        if call_summary_observer.transcript_lines:
+            transcript = "\n".join(call_summary_observer.transcript_lines)
+            summary = analyze_call(transcript)
+            summary["transcript"] = transcript
+            if call_summary_observer.booking_id:
+                summary["booking_id"] = call_summary_observer.booking_id
             if recorded_audio.get("audio"):
                 wav_bytes = audio_to_wav(
                     recorded_audio["audio"],
